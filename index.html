@@ -426,12 +426,21 @@
         </div>
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
     <script>
         // --- DATA SETUP ---
         let currentDate = new Date(); 
         let displayYear = currentDate.getFullYear();
         let displayMonth = currentDate.getMonth();
         let currentOpenMeetingId = null; 
+
+        const SUPABASE_URL = 'https://lcqxorfwgzgdzblhjawp.supabase.co';
+        const SUPABASE_KEY = 'sb_publishable_X2fNP8wA2qyU1EPTzqKx1w_WeSXNa9B';
+        const OFFLINE_QUEUE_KEY = 'meeting-calendar-pending-queue';
+
+        let supabase = null;
+        let pendingOfflineMeetings = [];
+        let isOnline = navigator.onLine;
 
         const monthNames = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 
@@ -448,6 +457,118 @@
             { id: 4, title: "Annual Dev Summit", ownerId: null, startDate: "2026-05-16", endDate: "2026-05-18", time: "09:00 AM", status: "SCHEDULED", location: "Convention Center", description: "Multi-day tech conference and networking event. No specific client." },
             { id: 5, title: "Acquire Permitting Documents", ownerId: null, startDate: "2026-06-15", endDate: "2026-06-15", time: "11:00 AM", status: "SCHEDULED", location: "City Hall", description: "Pick up the signed zoning documents." }
         ];
+
+        function loadPendingQueue() {
+            try {
+                let saved = localStorage.getItem(OFFLINE_QUEUE_KEY);
+                pendingOfflineMeetings = saved ? JSON.parse(saved) : [];
+            } catch (err) {
+                console.warn('Failed to load pending queue', err);
+                pendingOfflineMeetings = [];
+            }
+        }
+
+        function savePendingQueue() {
+            try {
+                if (pendingOfflineMeetings.length) {
+                    localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(pendingOfflineMeetings));
+                } else {
+                    localStorage.removeItem(OFFLINE_QUEUE_KEY);
+                }
+            } catch (err) {
+                console.warn('Failed to save pending queue', err);
+            }
+        }
+
+        function addPendingMeeting(meeting) {
+            pendingOfflineMeetings.push(meeting);
+            savePendingQueue();
+        }
+
+        async function ensureSupabaseLibrary() {
+            if (window.supabase && typeof window.supabase.createClient === 'function') return;
+            return new Promise((resolve, reject) => {
+                const existing = document.querySelector('script[data-supabase-loader]');
+                if (existing) {
+                    existing.addEventListener('load', resolve);
+                    existing.addEventListener('error', reject);
+                    return;
+                }
+                const script = document.createElement('script');
+                script.src = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2';
+                script.dataset.supabaseLoader = 'true';
+                script.onload = resolve;
+                script.onerror = reject;
+                document.head.appendChild(script);
+            });
+        }
+
+        async function initSupabaseClient() {
+            if (!window.supabase || typeof window.supabase.createClient !== 'function') {
+                try {
+                    await ensureSupabaseLibrary();
+                } catch (err) {
+                    console.warn('Supabase library unavailable', err);
+                    return;
+                }
+            }
+            if (!supabase && window.supabase && typeof window.supabase.createClient === 'function') {
+                supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+            }
+        }
+
+        async function fetchMeetings() {
+            if (navigator.onLine) {
+                await initSupabaseClient();
+                if (supabase) {
+                    try {
+                        const { data, error } = await supabase.from('meetings').select('*');
+                        if (error) throw error;
+                        meetings = data.map(m => ({ id: m.id, title: m.title, ownerId: m.owner_id, startDate: m.start_date, endDate: m.end_date, time: m.time || 'TBD', status: m.status, location: m.location, description: m.description }));
+                        if (pendingOfflineMeetings.length) {
+                            let offlineItems = pendingOfflineMeetings.map(m => ({ ...m, isPending: true }));
+                            meetings = meetings.filter(item => !item.isPending).concat(offlineItems);
+                        }
+                        refreshViews();
+                        return;
+                    } catch (err) {
+                        console.warn('Supabase fetch failed', err);
+                    }
+                }
+            }
+            if (pendingOfflineMeetings.length) {
+                let offlineItems = pendingOfflineMeetings.map(m => ({ ...m, isPending: true }));
+                meetings = meetings.filter(item => !item.isPending).concat(offlineItems);
+            }
+            refreshViews();
+        }
+
+        async function syncPendingMeetings() {
+            if (!navigator.onLine) return;
+            await initSupabaseClient();
+            if (!supabase || pendingOfflineMeetings.length === 0) return;
+            try {
+                const insertData = pendingOfflineMeetings.map(m => ({ title: m.title, owner_id: m.ownerId, start_date: m.startDate, end_date: m.endDate, time: m.time, status: m.status, location: m.location, description: m.description }));
+                const { error } = await supabase.from('meetings').insert(insertData);
+                if (error) throw error;
+                pendingOfflineMeetings = [];
+                savePendingQueue();
+                showToast('Offline events synced to cloud');
+                await fetchMeetings();
+            } catch (err) {
+                console.warn('Offline sync failed', err);
+            }
+        }
+
+        function updateOnlineStatus() {
+            isOnline = navigator.onLine;
+            if (isOnline) {
+                showToast('Back online — syncing pending events');
+                syncPendingMeetings();
+            } else {
+                showToast('Offline mode: new events will sync when you reconnect');
+            }
+        }
 
         function getTodayStr() { return `${currentDate.getFullYear()}-${String(currentDate.getMonth()+1).padStart(2,'0')}-${String(currentDate.getDate()).padStart(2,'0')}`; }
 
@@ -526,7 +647,7 @@
             openAddModal(dateVal);
         }
 
-        function saveNewMeeting() {
+        async function saveNewMeeting() {
             let title = document.getElementById('add-title').value.trim();
             let contactSelectVal = document.getElementById('add-contact').value;
             let start = document.getElementById('add-start-date').value;
@@ -548,8 +669,8 @@
                 finalContactId = parseInt(contactSelectVal);
             }
 
-            meetings.push({
-                id: Date.now() + 1,
+            let newMeeting = {
+                id: Date.now(),
                 title: title,
                 ownerId: finalContactId, 
                 startDate: start,
@@ -557,12 +678,37 @@
                 time: document.getElementById('add-time').value.trim() || 'TBD',
                 status: 'SCHEDULED',
                 location: document.getElementById('add-location').value.trim(),
-                description: document.getElementById('add-desc').value.trim()
-            });
+                description: document.getElementById('add-desc').value.trim(),
+                isPending: !navigator.onLine
+            };
 
+            meetings.push(newMeeting);
             document.getElementById('addModal').style.display = 'none';
             refreshViews();
-            showToast("Event saved successfully");
+
+            if (!navigator.onLine) {
+                addPendingMeeting(newMeeting);
+                showToast("Saved locally and will sync when online");
+                return;
+            }
+
+            await initSupabaseClient();
+            if (!supabase) {
+                addPendingMeeting(newMeeting);
+                showToast("Saved locally and will sync when online");
+                return;
+            }
+
+            try {
+                const { error } = await supabase.from('meetings').insert([{ title: newMeeting.title, owner_id: newMeeting.ownerId, start_date: newMeeting.startDate, end_date: newMeeting.endDate, time: newMeeting.time, status: newMeeting.status, location: newMeeting.location, description: newMeeting.description }]);
+                if (error) throw error;
+                showToast("Event saved to cloud");
+                await fetchMeetings();
+            } catch (err) {
+                console.warn('Save error, queueing for later sync', err);
+                addPendingMeeting(newMeeting);
+                showAlert("Sync failed", "Saved locally and will retry when you are back online.");
+            }
         }
 
         // --- EDIT & DELETE LOGIC ---
@@ -867,9 +1013,13 @@
         }
 
         // Initialize on Load
-        window.onload = function() { 
+        window.onload = async function() { 
+            loadPendingQueue();
             populateContactDropdowns();
-            renderYearlyView(); 
+            updateOnlineStatus();
+            await fetchMeetings();
+            window.addEventListener('online', updateOnlineStatus);
+            window.addEventListener('offline', updateOnlineStatus);
         };
     </script>
 </body>
